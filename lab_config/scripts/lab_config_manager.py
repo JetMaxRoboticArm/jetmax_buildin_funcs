@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+import sys
 import cv2
 import rospy
 import yaml
@@ -17,7 +19,7 @@ kernel_erode = 3
 kernel_dilate = 3
 color_ranges = {}
 current_range = {'min': [0, 0, 0], 'max': [100, 100, 100]}
-config_file_path = "lab_config.yaml"
+config_file_path = os.path.join(sys.path[0], "../config/lab_config.yaml")
 heartbeat_timer = None
 sub_ed = False
 

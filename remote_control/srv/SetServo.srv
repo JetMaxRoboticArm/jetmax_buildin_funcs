@@ -1,0 +1,6 @@
+uint8 servo_id
+float32 angle
+float32 duration
+---
+bool success
+string message

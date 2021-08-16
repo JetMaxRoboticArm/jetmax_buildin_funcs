@@ -1,0 +1,6 @@
+string axis_name
+float32 change_value
+float32 duration
+---
+bool success
+string message

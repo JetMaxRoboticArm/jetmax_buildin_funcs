@@ -1,0 +1,12 @@
+float32 x
+float32 y
+float32 z
+float32 joint1
+float32 joint2
+float32 joint3
+float32 servo1
+float32 servo2
+float32 servo3
+float32 pwm1
+float32 pwm2
+bool    sucker

@@ -1,0 +1,3 @@
+float32 velocity
+float32 direction
+float32 angular_rate

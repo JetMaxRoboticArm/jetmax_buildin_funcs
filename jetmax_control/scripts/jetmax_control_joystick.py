@@ -5,12 +5,13 @@ import rospy
 import threading
 import numpy as np
 import pygame as pg
+import threading
 from functools import partial
 import hiwonder
 
 ROS_NODE_NAME = 'remote_control_joystick'
-jetmax = hiwonder.JetMax()
-sucker = hiwonder.Sucker()
+jetmax = None
+sucker = None 
 enable_control = True
 os.environ["SDL_VIDEODRIVER"] = "dummy"  # For use PyGame without opening a visible display
 pg.display.init()
@@ -71,8 +72,8 @@ def change_mode(new_mode):
 def set_pwm_servo1(v, dur):
     global servo1
     servo1 += v
-    servo1 = 180 if servo1 > 180 else servo1
-    servo1 = 0 if servo1 < 0 else servo1
+    servo1 = servo1 if servo1 < 180 else 180
+    servo1 = servo1 if servo1 > 0 else 0
     hiwonder.pwm_servo1.set_position(servo1, dur)
 
 JOINT_MODE_PRESSED_ACTION_MAP = {
@@ -113,8 +114,8 @@ COORDINATE_MODE_PRESSED_ACTION_MAP = {
     "SQUARE": partial(set_pwm_servo1, 2, 0),
     "L_HAT_LEFT": partial(jetmax.set_position_relatively, (-1, 0, 0), 0.05),
     "L_HAT_RIGHT": partial(jetmax.set_position_relatively, (1, 0, 0), 0.05),
-    "L_HAT_UP": partial(jetmax.set_position_relatively, (0, -1, 0), 0.05),
-    "L_HAT_DOWN": partial(jetmax.set_position_relatively, (0, 1, 0), 0.05),
+    "L_HAT_UP": partial(jetmax.set_position_relatively, (0, 1, 0), 0.05),
+    "L_HAT_DOWN": partial(jetmax.set_position_relatively, (0, -1, 0), 0.05),
     "L1": partial(jetmax.set_position_relatively, (0, 0, 1), 0.05),
     "L2": partial(jetmax.set_position_relatively, (0, 0, -1), 0.05),
 }
@@ -124,8 +125,8 @@ COORDINATE_MODE_HOLD_ACTION_MAP = {
     "SQUARE": partial(set_pwm_servo1, 5, 0),
     "L_HAT_LEFT": partial(jetmax.set_position_relatively, (-4, 0, 0), 0.05),
     "L_HAT_RIGHT": partial(jetmax.set_position_relatively, (4, 0, 0), 0.05),
-    "L_HAT_UP": partial(jetmax.set_position_relatively, (0, -4, 0), 0.05),
-    "L_HAT_DOWN": partial(jetmax.set_position_relatively, (0, 4, 0), 0.05),
+    "L_HAT_UP": partial(jetmax.set_position_relatively, (0, 4, 0), 0.05),
+    "L_HAT_DOWN": partial(jetmax.set_position_relatively, (0, -4, 0), 0.05),
     "L1": partial(jetmax.set_position_relatively, (0, 0, 4), 0.05),
     "L2": partial(jetmax.set_position_relatively, (0, 0, -4), 0.05),
 }
@@ -224,9 +225,28 @@ class Joystick:
 
 
 
-js = Joystick()
+
+def joystick_loop():
+    js = Joystick()
+    hiwonder.pwm_servo1.set_position(90, 1)
+    sucker.release()
+    rospy.sleep(1)
+    change_mode(0)  # Joint mode as the default mode
+    while True:
+        try:
+            js.update_buttons()
+            rospy.sleep(0.05)
+            if rospy.is_shutdown():
+                sys.exit(0)
+        except KeyboardInterrupt:
+            sys.exit(0)
+
+
 if __name__ == '__main__':
     rospy.init_node(ROS_NODE_NAME, log_level=rospy.INFO)
+    jetmax = hiwonder.JetMax()
+    sucker = hiwonder.Sucker()
+    js = Joystick()
     jetmax.go_home(1)
     hiwonder.pwm_servo1.set_position(90, 1)
     sucker.release()

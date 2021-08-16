@@ -5,7 +5,6 @@
         <rosparam>
             kernel_erode: 5
             kernel_dilate: 5
-            config_file_path: "/home/hiwonder/ros/src/lab_config/config/lab_config.yaml"
         </rosparam>
     </node>
 

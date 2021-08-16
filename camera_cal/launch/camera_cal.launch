@@ -1,0 +1,10 @@
+<!-- -*- mode: XML -*- -->
+<launch>
+    <rosparam file="$(find camera_cal)/config/camera_cal.yaml" command="load" ns="camera_cal"/>
+    <node name="camera_cal" pkg="camera_cal" type="camera_cal_main.py" required="true" output="screen">
+        <rosparam>
+            config_file_path: "/home/hiwonder/ros/src/camera_cal/config/camera_cal.yaml"
+        </rosparam>
+    </node>
+
+</launch>

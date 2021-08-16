@@ -1,0 +1,7 @@
+string data
+uint32 repeat
+---
+bool result
+---
+uint32 index
+uint32 count

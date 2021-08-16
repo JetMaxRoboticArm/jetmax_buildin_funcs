@@ -6,29 +6,31 @@ import threading
 import numpy as np
 import rospy
 from sensor_msgs.msg import Image
+from std_msgs.msg import Bool
 from std_srvs.srv import Empty
 from std_srvs.srv import SetBool, SetBoolResponse, SetBoolRequest
 from std_srvs.srv import Trigger, TriggerResponse, TriggerRequest
 from color_sorting.srv import SetTarget, SetTargetResponse, SetTargetRequest
+from std_msgs.msg import Bool
+from jetmax_control.msg import SetServo
 import hiwonder
-from hiwonder import serial_servo as ss
 
 ROS_NODE_NAME = "color_sorting"
-ORIGIN_X, ORIGIN_Y, ORIGIN_Z = 0, 138 + 8.14, 84.4 + 128.4
-IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y = 260, 280
+IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y = 260, 280
 SUCKER_PIXEL_X, SUCKER_PIXEL_Y = 328.3, 380.23
 IMAGE_PROC_SIZE = 640, 480
-ik = hiwonder.kinematic.IKinematic()
+
+jetmax = hiwonder.JetMax()
+sucker = hiwonder.Sucker()
 
 
 class ColorSortingState:
     def __init__(self):
-        self.position = 0, 0, 0
         self.target_colors = {}
         self.target_positions = {
-            'green': ((215, -38, 90), 10),
-            'red': ((215, 10, 90), -5),
-            'blue': ((215, -87, 90), 18)
+            'green': ((218, 20, 90), 10),
+            'red': ((218, -25, 90), -5),
+            'blue': ((218, 65, 90), 18)
         }
         self.heartbeat_timer = None
         self.is_running = False
@@ -50,84 +52,72 @@ class ColorSortingState:
 state = ColorSortingState()
 
 
-def move_to_pos(x, y, z, t):
-    angles = ik.resolve(x, y, z)
-    if angles is None:
-        return
-    p1, p2, p3 = angles
-    p3 = 490 if p3 < 490 else p3
-    ss.set_position(1, int(p1), t)
-    ss.set_position(2, int(p2), t)
-    ss.set_position(3, int(p3), t)
-    state.position = x, y, z
-
-
-def init():
-    hiwonder.motor1.set_speed(0)
-    hiwonder.motor2.set_speed(100)
-    hiwonder.pwm_servo1.set_position(90, 1000)
-    move_to_pos(ORIGIN_X, ORIGIN_Y, ORIGIN_Z, 1000)
-    state.reset()
-    rospy.sleep(1)
-    hiwonder.motor2.set_speed(0)
-
-
 def moving():
     rect, box, color_name = state.moving_color
-    cur_x, cur_y, cur_z = state.position
+    cur_x, cur_y, cur_z = jetmax.position
     rect_x, rect_y = rect[0]
 
-    x = (SUCKER_PIXEL_X - rect_x) * (100.0 / IMAGE_PIXEL_PER_100MM_X)
-    y = (SUCKER_PIXEL_Y - rect_y) * (100.0 / IMAGE_PIXEL_PER_100MM_Y) + 40
+    try:
+        x = (SUCKER_PIXEL_X - rect_x) * (100.0 / IMAGE_PIXEL_PRE_100MM_X)
+        y = (SUCKER_PIXEL_Y - rect_y) * (100.0 / IMAGE_PIXEL_PRE_100MM_Y)
 
-    # Calculate the distance between the current position and the target position to control the movement speed
-    dist = math.sqrt(x * x + y * y + 120 * 120)
-    t = dist / 160
+        # Calculate the distance between the current position and the target position to control the movement speed
+        dist = math.sqrt(x * x + y * y + 120 * 120)
+        t = dist / 160
 
-    angle = rect[2]
-    if angle < -45:
-        angle = 90 + angle
-    arm_angle = math.atan((cur_x + x) / (cur_y + y)) * 180 / math.pi
-    if arm_angle > 0:
-        arm_angle = -(-90 - (arm_angle - 90))
-    angle = arm_angle + angle
+        angle = rect[2]
+        if angle < -45:  # ccw -45 ~ -90
+            angle = -(-90 - angle)
 
-    # Pick up the block
-    hiwonder.pwm_servo1.set_position(90 + angle, 100)
-    move_to_pos(cur_x + x, cur_y + y, 120, int(t * 1000))
-    rospy.sleep(t)
+        new_x, new_y = cur_x + x, cur_y - y - 30
+        arm_angle = math.atan(new_y / new_x) * 180 / math.pi
+        if arm_angle > 0:
+            arm_angle = (90 - arm_angle)
+        elif arm_angle < 0:
+            arm_angle = (-90 - arm_angle)
+        else:
+            pass
 
-    hiwonder.motor1.set_speed(100)  # Turn on the air pump
-    move_to_pos(cur_x + x, cur_y + y, 80, 1000)
-    rospy.sleep(1)
+        print(angle, arm_angle, arm_angle + angle)
+        angle =  angle + -arm_angle
 
-    cur_x, cur_y, cur_z = state.position
-    move_to_pos(cur_x, cur_y, 180, 800)
-    rospy.sleep(0.8)
+        # Pick up the block
+        hiwonder.pwm_servo1.set_position(90 + angle, 0.1)
+        jetmax.set_position((new_x, new_y, 120), t)
+        rospy.sleep(t)
+        sucker.set_state(True)  # Turn on the air pump
+        jetmax.set_position((new_x, new_y, 80), 1)
+        rospy.sleep(1)
 
-    # Go to the target position
-    (x, y, z), angle = state.target_positions[color_name]
-    cur_x, cur_y, cur_z = state.position
-    t = math.sqrt(((cur_x - x) ** 2 + (cur_y - y) ** 2)) / 180.0
-    hiwonder.pwm_servo1.set_position(90 + angle, 500)
-    move_to_pos(x, y, 160, int(t * 1000))
-    rospy.sleep(t)
-    move_to_pos(x, y, z, 1000)
-    rospy.sleep(1)
+        cur_x, cur_y, cur_z = jetmax.position
+        jetmax.set_position((cur_x, cur_y, 180), 0.8)
+        rospy.sleep(0.8)
+        hiwonder.pwm_servo1.set_position(90, 0.1)
+        #jetmax.go_home(1)
+        #rospy.sleep(5)
 
-    # Put down the block
-    hiwonder.motor1.set_speed(0)  # Turn off the air pump
-    hiwonder.motor2.set_speed(100)  # Open the vent valve
-    move_to_pos(x, y, 140, 800)
-    rospy.sleep(0.8)
-    hiwonder.pwm_servo1.set_position(90, 500)
-    hiwonder.motor2.set_speed(0)
+        # Go to the target position
+        (x, y, z), angle = state.target_positions[color_name]
+        cur_x, cur_y, cur_z = jetmax.position
+        t = math.sqrt(((cur_x - x) ** 2 + (cur_y - y) ** 2)) / 180.0
+        hiwonder.pwm_servo1.set_position(90 + angle, 0.5)
+        jetmax.set_position((x, y, 140), t)
+        rospy.sleep(t)
+        jetmax.set_position((x, y, z), 1)
+        rospy.sleep(1)
 
-    # Go home
-    move_to_pos(ORIGIN_X, ORIGIN_Y, ORIGIN_Z, 2000)
-    rospy.sleep(2.5)
-    state.runner = None
-    state.is_moving = False
+        # Put down the block
+        sucker.set_state(False)  # Turn off the air pump
+        jetmax.set_position((x, y, 140), 0.8)
+        rospy.sleep(0.8)
+    finally:
+        # Go home
+        sucker.set_state(False)
+        hiwonder.pwm_servo1.set_position(90, 0.5)
+        jetmax.go_home(2)
+        rospy.sleep(2.5)
+        state.runner = None
+        state.is_moving = False
 
 
 def image_proc(img):
@@ -151,13 +141,13 @@ def image_proc(img):
                 center_x, center_y = rect[0]
                 box = np.int0(cv2.boxPoints(rect))  # The four vertices of the minimum-area-rectangle
                 # If the contour is out of the recognition zone, skip it
-                if center_y > (SUCKER_PIXEL_Y + IMAGE_PIXEL_PER_100MM_Y / 100 * 80):
+                if center_y > (SUCKER_PIXEL_Y + IMAGE_PIXEL_PRE_100MM_Y / 100 * 80):
                     continue
                 for i, p in enumerate(box):
                     box[i, 0] = int(hiwonder.misc.val_map(p[0], 0, IMAGE_PROC_SIZE[0], 0, img_w))
                     box[i, 1] = int(hiwonder.misc.val_map(p[1], 0, IMAGE_PROC_SIZE[1], 0, img_h))
-                cv2.drawContours(org_img, [box], -1, hiwonder.colors[color_name.upper()], 2)
-                cv2.circle(org_img, (int(center_x), int(center_y)), 1, hiwonder.colors[color_name.upper()], 5)
+                cv2.drawContours(org_img, [box], -1, hiwonder.COLORS[color_name.upper()], 2)
+                cv2.circle(org_img, (int(center_x), int(center_y)), 1, hiwonder.COLORS[color_name.upper()], 5)
                 rect = list(rect)
                 rect[0] = (center_x, center_y)
                 blocks.append((rect, box, color_name))
@@ -189,6 +179,7 @@ def image_proc(img):
                     o_angle = angle * 0.2 + o_angle * 0.8
                     rect = (o_x, o_y), (w, h), o_angle
                     moving_color = rect, box, color_name
+                    print(o_angle)
                     if state.count > 30 and not state.is_moving:
                         state.moving_color = moving_color
                         state.is_moving = True
@@ -222,12 +213,13 @@ def image_callback(ros_image):
 
 def enter_func(msg):
     rospy.loginfo("Enter color sorting")
-    global SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y
+    global SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y
     exit_func(msg)
-    init()
+    jetmax.go_home()
+    state.reset()
     rospy.ServiceProxy('/usb_cam/start_capture', Empty)()
-    SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y = rospy.get_param(
-        '/camera_cal/block', [SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y])
+    SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y = rospy.get_param(
+        '/camera_cal/block', [SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y])
     state.image_sub = rospy.Subscriber('/usb_cam/image_rect_color', Image, image_callback)
     return TriggerResponse(success=True)
 
@@ -239,9 +231,12 @@ def exit_func(msg):
         state.heartbeat_timer.cancel()
     if isinstance(state.runner, threading.Thread):  # If the arm is moving, wait for it to complete
         state.runner.join()
-    if isinstance(state.image_sub, rospy.Subscriber)
+    if isinstance(state.image_sub, rospy.Subscriber):
         state.image_sub.unregister()
         state.image_sub = None
+    rospy.ServiceProxy('/jetmax/go_home', Empty)()
+    rospy.Publisher('/jetmax/end_effector/sucker/command', Bool, queue_size=1).publish(data=False)
+    rospy.Publisher('/jetmax/end_effector/servo1/command', SetServo, queue_size=1).publish(data=90, duration=0.5)
     return TriggerResponse(success=True)
 
 
@@ -255,15 +250,15 @@ def set_running(msg: SetBoolRequest):
 
 
 def set_target_cb(msg: SetTargetRequest):
-    global SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y
+    global SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y
     try:
         if msg.is_enable:
             color_ranges = rospy.get_param('/lab_config_manager/color_range_list', {})
             with state.lock:
                 state.target_colors[msg.color_name] = color_ranges[msg.color_name]
-                SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y = rospy.get_param(
+                SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y = rospy.get_param(
                     '/camera_cal/block',
-                    [SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y])
+                    [SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y])
             rospy.logdebug('set target color ' + str(msg))
         else:
             with state.lock:
@@ -300,11 +295,11 @@ def heartbeat_srv_cb(msg: SetBoolRequest):
 if __name__ == '__main__':
     rospy.init_node(ROS_NODE_NAME, log_level=rospy.DEBUG)
     rospy.sleep(0.2)
-    init()
-    SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y = rospy.get_param(
+    state.reset()
+    SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y = rospy.get_param(
         '/camera_cal/block',
-        [SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y])
-    print(SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PER_100MM_X, IMAGE_PIXEL_PER_100MM_Y)
+        [SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y])
+    print(SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y)
     image_pub = rospy.Publisher('/%s/image_result' % ROS_NODE_NAME, Image, queue_size=1)  # register image publisher
     enter_srv = rospy.Service('/%s/enter' % ROS_NODE_NAME, Trigger, enter_func)
     exit_srv = rospy.Service('/%s/exit' % ROS_NODE_NAME, Trigger, exit_func)
