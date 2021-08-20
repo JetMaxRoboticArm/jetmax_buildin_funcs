@@ -6,7 +6,6 @@ import threading
 import numpy as np
 import rospy
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool
 from std_srvs.srv import Empty
 from std_srvs.srv import SetBool, SetBoolResponse, SetBoolRequest
 from std_srvs.srv import Trigger, TriggerResponse, TriggerRequest
@@ -16,60 +15,100 @@ from jetmax_control.msg import SetServo
 import hiwonder
 
 ROS_NODE_NAME = "color_sorting"
-IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y = 260, 280
-SUCKER_PIXEL_X, SUCKER_PIXEL_Y = 328.3, 380.23
 IMAGE_PROC_SIZE = 640, 480
+unit_block_corners = np.asarray([[0, 0, 0],
+                                 [20, -20, 0],  # TAG_SIZE = 33.30mm
+                                 [-20, -20, 0],
+                                 [-20, 20, 0],
+                                 [20, 20, 0]],
+                                dtype=np.float64)
+unit_block_img_pts = None
 
-jetmax = hiwonder.JetMax()
-sucker = hiwonder.Sucker()
+
+def camera_to_world(cam_mtx, r, t, img_points):
+    inv_k = np.asmatrix(cam_mtx).I
+    r_mat = np.zeros((3, 3), dtype=np.float64)
+    cv2.Rodrigues(r, r_mat)
+    # invR * T
+    inv_r = np.asmatrix(r_mat).I  # 3*3
+    transPlaneToCam = np.dot(inv_r, np.asmatrix(t))  # 3*3 dot 3*1 = 3*1
+    world_pt = []
+    coords = np.zeros((3, 1), dtype=np.float64)
+    for img_pt in img_points:
+        coords[0][0] = img_pt[0][0]
+        coords[1][0] = img_pt[0][1]
+        coords[2][0] = 1.0
+        worldPtCam = np.dot(inv_k, coords)  # 3*3 dot 3*1 = 3*1
+        # [x,y,1] * invR
+        worldPtPlane = np.dot(inv_r, worldPtCam)  # 3*3 dot 3*1 = 3*1
+        # zc
+        scale = transPlaneToCam[2][0] / worldPtPlane[2][0]
+        # zc * [x,y,1] * invR
+        scale_worldPtPlane = np.multiply(scale, worldPtPlane)
+        # [X,Y,Z]=zc*[x,y,1]*invR - invR*T
+        worldPtPlaneReproject = np.asmatrix(scale_worldPtPlane) - np.asmatrix(transPlaneToCam)  # 3*1 dot 1*3 = 3*3
+        pt = np.zeros((3, 1), dtype=np.float64)
+        pt[0][0] = worldPtPlaneReproject[0][0]
+        pt[1][0] = worldPtPlaneReproject[1][0]
+        pt[2][0] = 0
+        world_pt.append(pt.T.tolist())
+    return world_pt
 
 
 class ColorSortingState:
     def __init__(self):
         self.target_colors = {}
         self.target_positions = {
-            'green': ((218, 20, 90), 10),
-            'red': ((218, -25, 90), -5),
-            'blue': ((218, 65, 90), 18)
+            'red': ((232, -25, 95), -5),
+            'green': ((233, 25, 95), 8),
+            'blue': ((237, 75, 95), 18)
         }
         self.heartbeat_timer = None
         self.is_running = False
-        self.is_moving = False
         self.image_sub = None
         self.moving_color = None
         self.lock = threading.RLock()
         self.runner = None
         self.count = 0
+        self.camera_params = None
+        self.K = None
+        self.R = None
+        self.T = None
+        self.WIDTH = None
 
     def reset(self):
         self.target_colors = {}
         self.is_running = False
-        self.is_moving = False
         self.moving_color = None
         self.count = 0
 
-
-state = ColorSortingState()
+    def load_camera_params(self):
+        global unit_block_img_pts
+        self.camera_params = rospy.get_param('/camera_cal/block_params', self.camera_params)
+        if self.camera_params is not None:
+            self.K = np.array(self.camera_params['K'], dtype=np.float64).reshape(3, 3)
+            self.R = np.array(self.camera_params['R'], dtype=np.float64).reshape(3, 1)
+            self.T = np.array(self.camera_params['T'], dtype=np.float64).reshape(3, 1)
+            img_pts, jac = cv2.projectPoints(unit_block_corners, self.R, self.T, self.K, None)
+            unit_block_img_pts = img_pts.reshape(5, 2)
+            l_p1 = unit_block_img_pts[-1]
+            l_p2 = unit_block_img_pts[-2]
+            self.WIDTH = math.sqrt((l_p1[0] - l_p2[0]) ** 2 + (l_p1[1] - l_p2[1]) ** 2)
+            print(unit_block_img_pts)
 
 
 def moving():
     rect, box, color_name = state.moving_color
     cur_x, cur_y, cur_z = jetmax.position
-    rect_x, rect_y = rect[0]
-
     try:
-        x = (SUCKER_PIXEL_X - rect_x) * (100.0 / IMAGE_PIXEL_PRE_100MM_X)
-        y = (SUCKER_PIXEL_Y - rect_y) * (100.0 / IMAGE_PIXEL_PRE_100MM_Y)
-
+        x, y, _ = camera_to_world(state.K, state.R, state.T, np.array(rect[0]).reshape((1, 1, 2)))[0][0]
         # Calculate the distance between the current position and the target position to control the movement speed
-        dist = math.sqrt(x * x + y * y + 120 * 120)
-        t = dist / 160
-
+        t = math.sqrt(x * x + y * y + 120 * 120) / 140
         angle = rect[2]
         if angle < -45:  # ccw -45 ~ -90
             angle = -(-90 - angle)
 
-        new_x, new_y = cur_x + x, cur_y - y - 30
+        new_x, new_y = cur_x + x, cur_y + y
         arm_angle = math.atan(new_y / new_x) * 180 / math.pi
         if arm_angle > 0:
             arm_angle = (90 - arm_angle)
@@ -78,52 +117,74 @@ def moving():
         else:
             pass
 
-        print(angle, arm_angle, arm_angle + angle)
-        angle =  angle + -arm_angle
+        angle = angle + -arm_angle
 
         # Pick up the block
         hiwonder.pwm_servo1.set_position(90 + angle, 0.1)
         jetmax.set_position((new_x, new_y, 120), t)
         rospy.sleep(t)
         sucker.set_state(True)  # Turn on the air pump
-        jetmax.set_position((new_x, new_y, 80), 1)
-        rospy.sleep(1)
+        jetmax.set_position((new_x, new_y, 85), 1)
+        rospy.sleep(1.05)
 
         cur_x, cur_y, cur_z = jetmax.position
         jetmax.set_position((cur_x, cur_y, 180), 0.8)
         rospy.sleep(0.8)
         hiwonder.pwm_servo1.set_position(90, 0.1)
-        #jetmax.go_home(1)
-        #rospy.sleep(5)
 
         # Go to the target position
         (x, y, z), angle = state.target_positions[color_name]
         cur_x, cur_y, cur_z = jetmax.position
         t = math.sqrt(((cur_x - x) ** 2 + (cur_y - y) ** 2)) / 180.0
         hiwonder.pwm_servo1.set_position(90 + angle, 0.5)
-        jetmax.set_position((x, y, 140), t)
+        jetmax.set_position((x, y, 180), t)
         rospy.sleep(t)
         jetmax.set_position((x, y, z), 1)
         rospy.sleep(1)
 
         # Put down the block
-        sucker.set_state(False)  # Turn off the air pump
+        sucker.release(3)  # Turn off the air pump
         jetmax.set_position((x, y, 140), 0.8)
         rospy.sleep(0.8)
+    except Exception as e:
+        rospy.logerr("ERROR")
     finally:
         # Go home
-        sucker.set_state(False)
+        sucker.release(3)
         hiwonder.pwm_servo1.set_position(90, 0.5)
         jetmax.go_home(2)
         rospy.sleep(2.5)
+        state.moving_color = None
         state.runner = None
-        state.is_moving = False
+
+
+def point_xy(pt_a, pt_b, r):
+    x_a, y_a = pt_a
+    x_b, y_b = pt_b
+    if x_a == x_b:
+        return x_a, y_a + (r / abs((y_b - y_a))) * (y_b - y_a)
+    k = (y_a - y_b) / (x_a - x_b)
+    b = y_a - k * x_a
+    A = k ** 2 + 1
+    B = 2 * ((b - y_a) * k - x_a)
+    C = (b - y_a) ** 2 + x_a ** 2 - r ** 2
+    x1 = (-B + math.sqrt(B ** 2 - 4 * A * C)) / (2 * A)
+    x2 = (-B - math.sqrt(B ** 2 - 4 * A * C)) / (2 * A)
+    y1 = k * x1 + b
+    y2 = k * x2 + b
+    dist_1 = math.sqrt((x1 - x_b) ** 2 + (y1 - y_b) ** 2)
+    dist_2 = math.sqrt((x2 - x_b) ** 2 + (y2 - y_b) ** 2)
+    if dist_1 <= dist_2:
+        return x1, y1
+    else:
+        return x2, y2
 
 
 def image_proc(img):
+    if state.runner is not None:
+        return img
     img_h, img_w = img.shape[:2]
-    org_img = np.copy(img)
-    frame_gb = cv2.GaussianBlur(img, (5, 5), 5)
+    frame_gb = cv2.GaussianBlur(np.copy(img), (5, 5), 5)
     frame_lab = cv2.cvtColor(frame_gb, cv2.COLOR_RGB2LAB)  # Convert rgb to lab
 
     blocks = []
@@ -139,17 +200,34 @@ def image_proc(img):
             for contour, area in contour_area:  # Loop through all the contours found
                 rect = cv2.minAreaRect(contour)
                 center_x, center_y = rect[0]
-                box = np.int0(cv2.boxPoints(rect))  # The four vertices of the minimum-area-rectangle
-                # If the contour is out of the recognition zone, skip it
-                if center_y > (SUCKER_PIXEL_Y + IMAGE_PIXEL_PRE_100MM_Y / 100 * 80):
-                    continue
-                for i, p in enumerate(box):
-                    box[i, 0] = int(hiwonder.misc.val_map(p[0], 0, IMAGE_PROC_SIZE[0], 0, img_w))
-                    box[i, 1] = int(hiwonder.misc.val_map(p[1], 0, IMAGE_PROC_SIZE[1], 0, img_h))
-                cv2.drawContours(org_img, [box], -1, hiwonder.COLORS[color_name.upper()], 2)
-                cv2.circle(org_img, (int(center_x), int(center_y)), 1, hiwonder.COLORS[color_name.upper()], 5)
+                box = cv2.boxPoints(rect)  # The four vertices of the minimum-area-rectangle
+                box_list = box.tolist()
+                box = np.int0(box)
+                ap = max(box_list, key=lambda p: math.sqrt((p[0] - state.K[0][2]) ** 2 + (p[1] - state.K[1][2]) ** 2))
+                index_ap = box_list.index(ap)
+                p1 = box_list[index_ap - 1 if index_ap - 1 >= 0 else 3]
+                p2 = box_list[index_ap + 1 if index_ap + 1 <= 3 else 0]
+                n_p1 = point_xy(ap, p1, state.WIDTH)
+                n_p2 = point_xy(ap, p2, state.WIDTH)
+
+                c_x, c_y = None, None
+                if n_p1 and n_p2:
+                    x_1, y_1 = n_p1
+                    x_2, y_2 = n_p2
+                    c_x = (x_1 + x_2) / 2
+                    c_y = (y_1 + y_2) / 2
+                    cv2.circle(img, (int(n_p1[0]), int(n_p1[1])), 2, (255, 255, 0), 10)
+                    cv2.circle(img, (int(n_p2[0]), int(n_p2[1])), 2, (255, 255, 0), 10)
+                    cv2.circle(img, (int(c_x), int(c_y)), 2, (0, 0, 0), 10)
+
+                cv2.circle(img, (int(ap[0]), int(ap[1])), 2, (0, 255, 255), 10)
+                cv2.drawContours(img, [box], -1, hiwonder.COLORS[color_name.upper()], 2)
+                cv2.circle(img, (int(center_x), int(center_y)), 1, hiwonder.COLORS[color_name.upper()], 5)
                 rect = list(rect)
-                rect[0] = (center_x, center_y)
+                if c_x:
+                    rect[0] = c_x, c_y
+                else:
+                    rect[0] = (center_x, center_y)
                 blocks.append((rect, box, color_name))
 
     if len(blocks) > 0:
@@ -165,44 +243,37 @@ def image_proc(img):
             blocks.sort(key=lambda tmp: tmp[1])
             moving_color, _ = blocks[0]
             x, y = moving_color[0][0]
-            cv2.drawContours(org_img, [moving_color[1]], -1, (255, 255, 255), 2)
-            cv2.circle(org_img, (int(x), int(y)), 1, (255, 255, 255), 5)
+            cv2.drawContours(img, [moving_color[1]], -1, (255, 255, 255), 2)
+            cv2.circle(img, (int(x), int(y)), 1, (255, 255, 255), 5)
 
-            if blocks[0][1] < 30:
-                state.count += 1
-                if state.count > 5:
-                    rect, box, color_name = moving_color
-                    (x, y), (w, h), angle = rect
-                    (o_x, o_y), _, o_angle = state.moving_color[0]
-                    o_x = x * 0.2 + o_x * 0.8
-                    o_y = y * 0.2 + o_y * 0.8
-                    o_angle = angle * 0.2 + o_angle * 0.8
-                    rect = (o_x, o_y), (w, h), o_angle
-                    moving_color = rect, box, color_name
-                    print(o_angle)
-                    if state.count > 30 and not state.is_moving:
-                        state.moving_color = moving_color
-                        state.is_moving = True
-                        state.count = 0
-                        state.runner = threading.Thread(target=moving, daemon=True)  # Move block
-                        state.runner.start()
-            else:
-                state.count = 0
-            if not state.is_moving:
+            state.count += 1
+            if state.count > 5:
+                rect, box, color_name = moving_color
+                (x, y), (w, h), angle = rect
+                (o_x, o_y), _, o_angle = state.moving_color[0]
+                o_x = x * 0.2 + o_x * 0.8
+                o_y = y * 0.2 + o_y * 0.8
+                o_angle = angle * 0.2 + o_angle * 0.8
+                rect = (o_x, o_y), (w, h), o_angle
+                moving_color = rect, box, color_name
+                if state.count > 30:
+                    state.count = 0
+                    state.moving_color = moving_color
+                    state.runner = threading.Thread(target=moving, daemon=True)  # Move block
+                    state.runner.start()
                 state.moving_color = moving_color
     else:
-        if state.moving_color is not None and not state.is_moving:
-            state.moving_color = None
+        state.moving_color = None
         state.count = 0
 
-    cv2.line(org_img, (int(img_w / 2 - 10), int(img_h / 2)), (int(img_w / 2 + 10), int(img_h / 2)), (0, 255, 255), 2)
-    cv2.line(org_img, (int(img_w / 2), int(img_h / 2 - 10)), (int(img_w / 2), int(img_h / 2 + 10)), (0, 255, 255), 2)
-    return org_img
+    cv2.line(img, (int(img_w / 2 - 10), int(img_h / 2)), (int(img_w / 2 + 10), int(img_h / 2)), (0, 255, 255), 2)
+    cv2.line(img, (int(img_w / 2), int(img_h / 2 - 10)), (int(img_w / 2), int(img_h / 2 + 10)), (0, 255, 255), 2)
+    return img
 
 
 def image_callback(ros_image):
     image = np.ndarray(shape=(ros_image.height, ros_image.width, 3), dtype=np.uint8, buffer=ros_image.data)
-    frame_result = image
+    frame_result = np.copy(image)
     with state.lock:
         if state.is_running:
             frame_result = image_proc(frame_result)
@@ -213,13 +284,10 @@ def image_callback(ros_image):
 
 def enter_func(msg):
     rospy.loginfo("Enter color sorting")
-    global SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y
     exit_func(msg)
     jetmax.go_home()
     state.reset()
-    rospy.ServiceProxy('/usb_cam/start_capture', Empty)()
-    SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y = rospy.get_param(
-        '/camera_cal/block', [SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y])
+    state.load_camera_params()
     state.image_sub = rospy.Subscriber('/usb_cam/image_rect_color', Image, image_callback)
     return TriggerResponse(success=True)
 
@@ -250,15 +318,11 @@ def set_running(msg: SetBoolRequest):
 
 
 def set_target_cb(msg: SetTargetRequest):
-    global SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y
     try:
         if msg.is_enable:
             color_ranges = rospy.get_param('/lab_config_manager/color_range_list', {})
             with state.lock:
                 state.target_colors[msg.color_name] = color_ranges[msg.color_name]
-                SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y = rospy.get_param(
-                    '/camera_cal/block',
-                    [SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y])
             rospy.logdebug('set target color ' + str(msg))
         else:
             with state.lock:
@@ -294,12 +358,14 @@ def heartbeat_srv_cb(msg: SetBoolRequest):
 
 if __name__ == '__main__':
     rospy.init_node(ROS_NODE_NAME, log_level=rospy.DEBUG)
+    state = ColorSortingState()
+    state.load_camera_params()
+    if state.camera_params is None:
+        rospy.logerr("Can not load camera params")
+        sys.exit(-1)
+    jetmax = hiwonder.JetMax()
+    sucker = hiwonder.Sucker()
     rospy.sleep(0.2)
-    state.reset()
-    SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y = rospy.get_param(
-        '/camera_cal/block',
-        [SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y])
-    print(SUCKER_PIXEL_X, SUCKER_PIXEL_Y, IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y)
     image_pub = rospy.Publisher('/%s/image_result' % ROS_NODE_NAME, Image, queue_size=1)  # register image publisher
     enter_srv = rospy.Service('/%s/enter' % ROS_NODE_NAME, Trigger, enter_func)
     exit_srv = rospy.Service('/%s/exit' % ROS_NODE_NAME, Trigger, exit_func)

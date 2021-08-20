@@ -1,133 +1,163 @@
 #!/usr/bin/env python3
+import os
 import sys
 import cv2
-import math
 import threading
-import numpy as np
 import rospy
+import numpy as np
+import yaml
+import hiwonder
+import apriltag
 from sensor_msgs.msg import Image
-from color_sorting.srv import SetTarget, SetTargetResponse, SetTargetRequest
 from jetmax_control.msg import SetJetMax
 from std_srvs.srv import SetBool, SetBoolResponse, SetBoolRequest
 from std_srvs.srv import Trigger, TriggerResponse, TriggerRequest
 from std_srvs.srv import Empty
-import hiwonder
-from hiwonder import serial_servo as ssr
-import yaml
-import os
+from sensor_msgs.msg import CameraInfo
 
 ROS_NODE_NAME = "camera_cal"
-IMAGE_PIXEL_PRE_100MM_X, IMAGE_PIXEL_PRE_100MM_Y = 270, 280.6
+at_detector = apriltag.Detector(apriltag.DetectorOptions(families='tag36h11'))
+marker_corners = np.asarray([[0, 0, 40],
+                             [16.65, -16.65, 40],  # TAG_SIZE = 33.30mm
+                             [-16.65, -16.65, 40],
+                             [-16.65, 16.65, 40],
+                             [16.65, 16.65, 40]],
+                            dtype=np.float64)
+marker_corners_block = np.copy(marker_corners)
+marker_corners_block[:, 2] = marker_corners_block[:, 2] - 40
 
 
-class ColorSortingCalState:
+class State:
     def __init__(self):
         self.lock = threading.RLock()
+        with open('/home/hiwonder/.ros/camera_info/head_camera.yaml') as f:
+            camera_params = yaml.load(f.read())
+            K_ = np.asarray([camera_params['camera_matrix']['data']]).reshape((3, 3))
+            self.D = np.asarray(camera_params['distortion_coefficients']['data'])
+            self.K = cv2.getOptimalNewCameraMatrix(K_, self.D, (640, 480), 0, (640, 480))[0]
         self.heartbeat_timer = None
-        self.position = 0, 0, 0
         self.image_sub = None
-        self.count = 0
-        self.color = {'min': (0, 0, 0), 'max': (255, 255, 255)}
-        self.center = 320, 240
-        self.rect = 0, 0, 640, 480
         self.is_running = False
+        self.enter = False
+        self.R = None
+        self.T = None
+        self.R_40 = None
+        self.T_40 = None
 
     def reset(self):
-        self.count = 0
-        self.center = 320, 240
-        self.rect = 0, 0, 640, 480
         self.is_running = False
+        self.enter = False
+        self.R = None
+        self.T = None
+        self.R_40 = None
+        self.T_40 = None
 
 
-state = ColorSortingCalState()
 
-
-def get_area_max_contour(contours, threshold):
-    # 找出面积最大的轮廓
-    # 参数为要比较的轮廓的列表
-    contour_area = map(lambda c: (c, math.fabs(cv2.contourArea(c))), contours)
-    contour_area = list(filter(lambda c: c[1] > threshold, contour_area))
-    if len(contour_area) > 0:
-        return max(contour_area, key=lambda c: c[1])
-    return None
-
-
-def init():
-    hiwonder.motor1.set_speed(0)
-    hiwonder.motor2.set_speed(100)
-    hiwonder.pwm_servo1.set_position(90, 1000)
-    state.reset()
-    rospy.ServiceProxy('/jetmax/go_home', Empty)()
-    hiwonder.motor2.set_speed(0)
+def camera_to_world(cam_mtx, r, t, img_points):
+    inv_k = np.asmatrix(cam_mtx).I
+    r_mat = np.zeros((3, 3), dtype=np.float64)
+    cv2.Rodrigues(r, r_mat)
+    # invR * T
+    inv_r = np.asmatrix(r_mat).I  # 3*3
+    transPlaneToCam = np.dot(inv_r, np.asmatrix(t))  # 3*3 dot 3*1 = 3*1
+    world_pt = []
+    coords = np.zeros((3, 1), dtype=np.float64)
+    for img_pt in img_points:
+        coords[0][0] = img_pt[0][0]
+        coords[1][0] = img_pt[0][1]
+        coords[2][0] = 1.0
+        worldPtCam = np.dot(inv_k, coords)  # 3*3 dot 3*1 = 3*1
+        # [x,y,1] * invR
+        worldPtPlane = np.dot(inv_r, worldPtCam)  # 3*3 dot 3*1 = 3*1
+        # zc
+        scale = transPlaneToCam[2][0] / worldPtPlane[2][0]
+        # zc * [x,y,1] * invR
+        scale_worldPtPlane = np.multiply(scale, worldPtPlane)
+        # [X,Y,Z]=zc*[x,y,1]*invR - invR*T
+        worldPtPlaneReproject = np.asmatrix(scale_worldPtPlane) - np.asmatrix(transPlaneToCam)  # 3*1 dot 1*3 = 3*3
+        pt = np.zeros((3, 1), dtype=np.float64)
+        pt[0][0] = worldPtPlaneReproject[0][0]
+        pt[1][0] = worldPtPlaneReproject[1][0]
+        pt[2][0] = 0
+        world_pt.append(pt.T.tolist())
+    return world_pt
 
 
 def image_proc(img):
-    img_h, img_w = img.shape[:2]
-    frame_gb = cv2.GaussianBlur(img, (3, 3), 5)
-    frame_lab = cv2.cvtColor(frame_gb, cv2.COLOR_RGB2LAB)  # 将图像转换到LAB空间
-
-    frame_mask = cv2.inRange(frame_lab, tuple(state.color['min']), tuple(state.color['max']))  # 对原图像和掩模进行位运算
-    eroded = cv2.erode(frame_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))  # 腐蚀
-    dilated = cv2.dilate(eroded, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))  # 膨胀
-    contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[-2]  # 找出轮廓
-    max_contour_area = get_area_max_contour(contours, 200)
-
-    if max_contour_area is not None:  # 画面中找到了选中的颜色
-        contour, area = max_contour_area
-        rect = cv2.minAreaRect(contour)
-        center_x, center_y = rect[0]
-        cv2.circle(img, (int(center_x), int(center_y)), 1, (255, 255, 255), 35)
-        rect = list(rect)
-        l_c_x, l_c_y = state.center
-        n_x, n_y = l_c_x * 0.98 + center_x * 0.02, l_c_y * 0.98 + center_y * 0.02
-        cv2.circle(img, (int(n_x), int(n_y)), 1, (255, 0, 0), 30)
-        cv2.line(img, (int(n_x), 0), (int(n_x), 479), (255, 255, 0), 2)
-        cv2.line(img, (0, int(n_y)), (639, int(n_y)), (255, 255, 0), 2)
-        state.center = (n_x, n_y)
-
-        x, y, w, h = cv2.boundingRect(contour)
-        l_x, l_y, l_w, l_h = state.rect
-        n_x = l_x * 0.98 + x * 0.02
-        n_y = l_y * 0.98 + y * 0.02
-        n_w = l_w * 0.98 + w * 0.02
-        n_h = l_h * 0.98 + h * 0.02
-        cv2.rectangle(img, (int(n_x), int(n_y)), (int(n_x + n_w), int(n_y + n_h)), (255, 255, 0), 2)
-        state.rect = (n_x, n_y, n_w, n_h)
-    else:
-        state.rect = (0, 0, 640, 480)
-        state.center = (320, 240)
+    frame_gray = cv2.cvtColor(np.copy(img), cv2.COLOR_RGB2GRAY)
+    tags = at_detector.detect(frame_gray)
+    for tag in tags:
+        center = np.array(tag.center).astype(int)
+        if tag.tag_id == 1:
+            corners = tag.corners.reshape(1, -1, 2).astype(np.float32)
+            pts = np.insert(corners[0], 0, values=tag.center, axis=0)
+            with state.lock:
+                rtl, new_r, new_t = cv2.solvePnP(marker_corners, pts, state.K, None)
+                if rtl:
+                    state.R = new_r if state.R is None else state.R * 0.95 + new_r * 0.05
+                    state.T = new_t if state.T is None else state.T * 0.95 + new_t * 0.05
+                rtl, new_r, new_t = cv2.solvePnP(marker_corners_block, pts, state.K, None)
+                if rtl:
+                    state.R_40 = new_r if state.R_40 is None else state.R_40 * 0.95 + new_r * 0.05
+                    state.T_40 = new_t if state.T_40 is None else state.T_40 * 0.95 + new_t * 0.05
+                if state.R is not None:
+                    img_pts, jac = cv2.projectPoints(marker_corners, state.R, state.T, state.K, None)
+                else:
+                    img_pts = []
+            corners = corners.astype(int)
+            cv2.circle(img, tuple(corners[0][0]), 5, (255, 0, 0), 12)
+            cv2.circle(img, tuple(corners[0][1]), 5, (0, 255, 0), 12)
+            cv2.circle(img, tuple(corners[0][2]), 5, (0, 0, 255), 12)
+            cv2.circle(img, tuple(corners[0][3]), 5, (0, 255, 255), 12)
+            cv2.circle(img, tuple(center), 5, (255, 255, 0), 12)
+            cv2.putText(img, "id:%d" % tag.tag_id,
+                        (center[0], center[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            for i, c in enumerate(img_pts):
+                cv2.circle(img, tuple(c.astype(int)[0]), 3, (0, 0, 0), 4)
+        else:
+            with state.lock:
+                if state.R_40 is not None:
+                    w = camera_to_world(state.K, state.R_40, state.T_40,
+                                        center.reshape((1, 1, 2)))[0][0]
+                else:
+                    w = 0, 0, 0
+            cv2.putText(img, "id:{} x:{:.2f} y:{:.2f}".format(tag.tag_id, w[0], w[1]),
+                        (center[0] - 20, center[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
     return img
 
 
 def image_callback(ros_image):
-    image = np.ndarray(shape=(ros_image.height, ros_image.width, 3), dtype=np.uint8, buffer=ros_image.data)
-    frame_result = image.copy()
-    with state.lock:
-        if state.is_running:
-            frame_result = image_proc(frame_result)
-    rgb_image = frame_result.tostring()
-    ros_image.data = rgb_image
-    image_pub.publish(ros_image)
+    if state.enter is True:
+        image = np.ndarray(shape=(ros_image.height, ros_image.width, 3), dtype=np.uint8, buffer=ros_image.data)
+        frame_result = image.copy()
+        with state.lock:
+            if state.is_running:
+                frame_result = image_proc(frame_result)
+        rgb_image = frame_result.tostring()
+        ros_image.data = rgb_image
+        image_pub.publish(ros_image)
 
 
 def enter_func(msg):
     rospy.loginfo("enter object tracking")
     exit_func(msg)
-    init()
-    rospy.ServiceProxy('/usb_cam/start_capture', Empty)()
-    state.image_sub = rospy.Subscriber('/usb_cam/image_rect_color', Image, image_callback)
+    state.reset()
+    state.enter = True
     return TriggerResponse(success=True)
 
 
 def exit_func(msg):
     rospy.loginfo("exit object tracking")
     state.is_running = False
+    state.enter = False
     if isinstance(state.heartbeat_timer, threading.Timer):
         state.heartbeat_timer.cancel()
-    if isinstance(state.image_sub, rospy.Subscriber):  # 注销图像节点的订阅, 这样回调就不会被调用了
-        rospy.loginfo('unregister image')
-        state.image_sub.unregister()
-        state.image_sub = None
+    #if isinstance(state.image_sub, rospy.Subscriber):
+    #    rospy.loginfo('unregister image')
+    #    state.image_sub.unregister()
+    #    state.image_sub = None
+    rospy.ServiceProxy('/jetmax/go_home', Empty)()
     return TriggerResponse(success=True)
 
 
@@ -135,8 +165,6 @@ def set_running(msg: SetBoolRequest):
     rospy.loginfo('set running' + str(msg))
     with state.lock:
         state.is_running = msg.data
-        color_ranges_ = rospy.get_param('/lab_config_manager/color_range_list', {})
-        state.color = color_ranges_['blue']
     return [True, '']
 
 
@@ -158,27 +186,32 @@ def heartbeat_srv_cb(msg: SetBoolRequest):
     return SetBoolResponse(success=msg.data)
 
 
-def save_cb(msg: TriggerRequest):
-    global block_params, card_params
-    rospy.loginfo(("save", msg))
+def save_cb(msg):
+    rospy.loginfo("save")
     with state.lock:
-        _, _, w, h = state.rect
-        w_p = w / 40.0 * 100.0
-        h_p = h / 40.0 * 100.0
-        c_x, c_y = state.center
-        card_params = [c_x, c_y, w_p, h_p]
-        rospy.set_param('~card', card_params)
+        card_params = {
+            "K": state.K.tolist(),
+            "R": state.R.tolist(),
+            "T": state.T.tolist()
+        }
+        block_params = {
+            "K": state.K.tolist(),
+            "R": state.R_40.tolist(),
+            "T": state.T_40.tolist()
+        }
         s = yaml.dump({
-            'block': block_params,
-            'card': card_params}, default_flow_style=False)
+            'card_params': card_params,
+            'block_params': block_params,
+        }, default_flow_style=True)
+        rospy.set_param('~card_params', card_params)
+        rospy.set_param('~block_params', block_params)
         with open(os.path.join(sys.path[0], '../config/camera_cal.yaml'), 'w') as f:
             f.write(s)
     return [True, '']
 
 
 def up_cb(msg: TriggerRequest):
-    pub = rospy.Publisher('/jetmax/command', SetJetMax, queue_size=1)
-    pub.publish(SetJetMax(
+    jetmax_pub.publish(SetJetMax(
         x=hiwonder.JetMax.ORIGIN[0],
         y=hiwonder.JetMax.ORIGIN[1],
         z=hiwonder.JetMax.ORIGIN[2],
@@ -188,30 +221,32 @@ def up_cb(msg: TriggerRequest):
 
 
 def down_cb(msg):
-    pub = rospy.Publisher('/jetmax/command', SetJetMax, queue_size=1)
-    pub.publish(SetJetMax(
+    jetmax_pub.publish(SetJetMax(
         x=hiwonder.JetMax.ORIGIN[0],
         y=hiwonder.JetMax.ORIGIN[1],
-        z=hiwonder.JetMax.ORIGIN[2] - 155,
+        z=hiwonder.JetMax.ORIGIN[2] - 115,
         duration=2
     ))
     return [True, '']
 
 
+def camera_cb(msg):
+    new_k = np.asarray(msg.K).reshape((3, 3))
+    new_d = np.asarray(msg.D)
+    new_k = cv2.getOptimalNewCameraMatrix(new_k, new_d, (640, 480), 0, (640, 480))[0]
+    with state.lock:
+        state.K = new_k
+        state.D = new_d
+
+
 if __name__ == '__main__':
+    state = State()
     rospy.init_node(ROS_NODE_NAME, log_level=rospy.DEBUG)
     rospy.sleep(0.2)
-    init()
-    color_ranges = rospy.get_param('/lab_config_manager/color_range_list', {})
-    state.color = color_ranges['blue']
-
-    card_params = rospy.get_param('~card', [320, 240, 260, 290])
-    block_params = rospy.get_param('~block', [320, 240, 260, 290])
-
-    rospy.set_param('~/card', card_params)
-    rospy.set_param('~/block', block_params)
-
+    state.image_sub = rospy.Subscriber('/usb_cam/image_rect_color', Image, image_callback)
+    jetmax_pub = rospy.Publisher('/jetmax/command', SetJetMax, queue_size=1)
     image_pub = rospy.Publisher('/%s/image_result' % ROS_NODE_NAME, Image, queue_size=1)  # register image publisher
+    camera_info_sub = rospy.Subscriber('/usb_cam/camera_info', CameraInfo, camera_cb, queue_size=1)
     enter_srv = rospy.Service('/%s/enter' % ROS_NODE_NAME, Trigger, enter_func)
     exit_srv = rospy.Service('/%s/exit' % ROS_NODE_NAME, Trigger, exit_func)
     running_srv = rospy.Service('/%s/set_running' % ROS_NODE_NAME, SetBool, set_running)
