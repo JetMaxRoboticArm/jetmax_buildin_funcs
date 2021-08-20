@@ -10,6 +10,7 @@ import hiwonder
 import threading
 import action_set
 
+
 # import jetmax_control_joystick as joystick
 
 
@@ -43,6 +44,10 @@ class JetMaxControl:
                                            queue_size=1,
                                            callback=lambda msg: self.jetmax.set_position((msg.x, msg.y, msg.z),
                                                                                          msg.duration))
+        self.jetmax_speed_sub = rospy.Subscriber('/jetmax/speed_command', SetJetMax,
+                                                 queue_size=1,
+                                                 callback=lambda msg: self.jetmax.set_position_with_speed(
+                                                     (msg.x, msg.y, msg.z), max(msg.duration, 0.001)))
         self.jetmax_relative_sub = rospy.Subscriber('/jetmax/relative_command', SetJetMax,
                                                     queue_size=1,
                                                     callback=lambda msg: self.jetmax.set_position_relatively(
@@ -52,6 +57,7 @@ class JetMaxControl:
         self.jetmax_joint_subs = []
         self.jetmax_servo_pubs = []
         self.jetmax_servo_subs = []
+        self.jetmax_servo_speed_subs = []
         for i in range(1, 4):
             joint_pub = rospy.Publisher('/jetmax/joint{}/status'.format(i), Float32, queue_size=1)
             joint_cmd = rospy.Subscriber('/jetmax/joint{}/command'.format(i), SetJoint,
@@ -67,10 +73,18 @@ class JetMaxControl:
                                          callback=lambda msg, servo_id: self.jetmax.set_servo(servo_id,
                                                                                               msg.data,
                                                                                               msg.duration))
+            servo_speed_cmd = rospy.Subscriber('/jetmax/servo{}/speed_command'.format(i), SetServo,
+                                               queue_size=1,
+                                               callback_args=i,
+                                               callback=lambda msg, servo_id: self.jetmax.set_servo_with_speed(
+                                                   servo_id,
+                                                   msg.data,
+                                                   msg.duration))
             self.jetmax_joint_pubs.append(joint_pub)
             self.jetmax_joint_subs.append(joint_cmd)
             self.jetmax_servo_pubs.append(servo_pub)
             self.jetmax_servo_subs.append(servo_cmd)
+            self.jetmax_servo_speed_subs.append(servo_speed_cmd)
 
         """
         End effector topics
@@ -101,7 +115,6 @@ class JetMaxControl:
         hiwonder.buzzer.on()
         rospy.sleep(0.1)
         hiwonder.buzzer.off()
-
 
     def go_home(self, req=None):
         self.jetmax.go_home(2)
@@ -147,7 +160,8 @@ class JetMaxControl:
                 x=x, y=y, z=z,
                 joint1=joint_states[0], joint2=joint_states[1], joint3=joint_states[2],
                 servo1=servo_states[0], servo2=servo_states[1], servo3=servo_states[2],
-                pwm1=hiwonder.pwm_servo1.get_position(), pwm2=hiwonder.pwm_servo2.get_position(), sucker=self.sucker.get_state()
+                pwm1=hiwonder.pwm_servo1.get_position(), pwm2=hiwonder.pwm_servo2.get_position(),
+                sucker=self.sucker.get_state()
             ))
 
             self.rate.sleep()
