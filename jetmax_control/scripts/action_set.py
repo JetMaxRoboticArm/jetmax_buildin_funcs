@@ -64,23 +64,24 @@ class ActionSetRunner:
         count = 0
         print(action_set)
         for i in range(repeat):
-            for action in action_set['data']:
-                duration = action['duration']
-                position = action['position']
-                pwm1, pwm2 = action['pwm_servos']
-                sucker = True if action['sucker'] else False
-                self._jetmax.set_position(position, duration)
-                hiwonder.pwm_servo1.set_position(pwm1, duration)
-                hiwonder.pwm_servo2.set_position(pwm2, duration)
-                if self._sucker.get_state() != sucker:
-                    self._sucker.set_state(sucker)
-                rospy.sleep(duration)
-                if self.action_set_online.is_preempt_requested():
-                    rospy.loginfo('run online: Preempted')
-                    self.action_set_online.set_preempted()
-                    success = False
-                    break
-                self.action_set_online.publish_feedback(ActionSetRawFeedback(index=i + 1, count=count))
+            if success:
+                for action in action_set['data']:
+                    duration = action['duration']
+                    position = action['position']
+                    pwm1, pwm2 = action['pwm_servos']
+                    sucker = True if action['sucker'] else False
+                    self._jetmax.set_position(position, duration)
+                    hiwonder.pwm_servo1.set_position(pwm1, duration)
+                    hiwonder.pwm_servo2.set_position(pwm2, duration)
+                    if self._sucker.get_state() != sucker:
+                        self._sucker.set_state(sucker)
+                    rospy.sleep(duration)
+                    if self.action_set_online.is_preempt_requested():
+                        rospy.loginfo('run online: Preempted')
+                        self.action_set_online.set_preempted()
+                        success = False
+                        break
+                    self.action_set_online.publish_feedback(ActionSetRawFeedback(index=i + 1, count=count))
             count += 1
         if success:
             self.action_set_online.set_succeeded(ActionSetRawResult(True))
